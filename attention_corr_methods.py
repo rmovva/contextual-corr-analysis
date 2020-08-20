@@ -108,6 +108,100 @@ def load_attentions(attention_fname_l, limit=None, layerspec_l=None,
     return num_heads_d, attentions_d
 
 
+def custom_load_attentions(attention_fname_l, limit=None, layerspec_l=None,
+                           ar_mask=False):
+    """
+    Load in attentions. Options to control loading exist. 
+
+    Params:
+    ----
+    attention_fname_l : list<str>
+        List of hdf5 files containing attentions
+    limit : int or None
+        Limit on number of attentions to take
+    layerspec_l : list
+        Specification for each model. May be an integer (layer to take),
+        or "all". "all" means take all layers. 
+    ar_mask : bool
+        Whether to mask the future when loading. Some models (eg. gpt)
+        do this automatically.
+
+    Returns:
+    ----
+    num_head_d : {str : int}
+        {network : number of heads}. Here a network could be a layer,
+        or the stack of all layers, etc. A network is what's being
+        correlated as a single unit.
+    attentions_d : {str : list<tensor>}
+        {network : attentions}. attentions is a list because each 
+        sentence may be of different length. 
+    """
+    # Edit args
+    l = len(attention_fname_l)
+    if layerspec_l is None:
+        layerspec_l = ['all'] * l
+
+    # Main loop
+    num_heads_d = {} 
+    attentions_d = {} 
+    for loop_var in tqdm(zip(attention_fname_l, layerspec_l), desc='load'):
+        fname, layerspec = loop_var
+
+        # Set `attentions_h5`, `sentence_d`, `indices`
+        attentions_h5 = h5py.File(fname, 'r')
+        indices = list(attentions_h5.keys())[:limit]
+
+        # Set `num_layers`, `num_heads`, `layers`
+        s = attentions_h5[indices[0]].shape
+        num_layers = s[0]
+        num_heads = s[1]
+        if layerspec == "all":
+            layers = list(range(num_layers))
+        else:
+            layers = [layerspec]
+
+        # Set `num_heads_d`, `attentions_d`
+        for layer in layers:
+            # Create `attentions_l`
+            attentions_l = []
+            word_count = 0
+            for sentence_ix in indices: 
+                # Set `dim`, `n_word`, update `word_count`
+                shape = attentions_h5[sentence_ix].shape
+                dim = len(shape)
+                if not (dim == 4):
+                    raise ValueError('Improper array dimension in file: ' +
+                                     fname + "\nShape: " +
+                                     str(attentions_h5[sentence_ix].shape))
+                n_word = shape[2]
+                word_count += n_word
+
+                # Create `attentions`
+                if ar_mask:
+                    attentions = np.tril(attentions_h5[sentence_ix][layer])
+                    attentions = attentions/np.sum(attentions, axis=-1,
+                                                   keepdims=True)
+                    attentions = torch.FloatTensor(attentions)
+                else:
+                    attentions = torch.FloatTensor(
+                        attentions_h5[sentence_ix][layer] )
+
+                # Update `attentions_l`
+                attentions_l.append(attentions)
+
+                # Early stop
+                if limit is not None and word_count >= limit:
+                    break
+
+            # Main update
+            network = "{mname}_{layer}".format(mname=fname2mname(fname), 
+                                                  layer=layer)
+            num_heads_d[network] = attentions_l[0].shape[0]
+            attentions_d[network] = attentions_l[:limit] 
+    
+    return num_heads_d, attentions_d
+
+
 class Method(object):
     """
     Abstract representation of a correlation method. 
@@ -479,7 +573,7 @@ class AttnLinCKA(ReprCorr):
             YtX_F = torch.norm(torch.mm(Y.t(), X), p='fro').item()
 
             # eq 5 in paper
-            sim = YtX_F**2 / (XtX_F*YtY_F)
+            sim = YtX_F**2 / (XtX_F*YtY_F + 1e-8)
             self.similarities[network][other_network] = sim
             self.similarities[other_network][network] = sim
 

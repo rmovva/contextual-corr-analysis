@@ -141,6 +141,134 @@ def load_representations(representation_fname_l, limit=None,
     return num_neurons_d, representations_d
 
 
+def custom_load_representations(representation_fname_l, limit=None,
+                         layerspec_l=None, first_half_only_l=False,
+                         second_half_only_l=False):
+    """
+    Load in representations. Options to control loading exist. 
+
+    Params:
+    ----
+    representation_fname_l : list<str>
+        List of hdf5 files containing representations
+    limit : int or None
+        Limit on number of representations to take
+    layerspec_l : list
+        Specification for each model. May be an integer (layer to take),
+        or "all" or "full". "all" means take all layers. "full" means to
+        concatenate all layers together.
+    first_half_only_l : list<bool>
+        Only take the first half of the representations for a given
+        model.
+        
+        If given a single value, will be copied into a list of the
+        correct length.
+    second_half_only_l : list<bool>
+        Only take the second half of the representations for a given
+        model. 
+
+        If given a single value, will be copied into a list of the
+        correct length.
+
+    Returns:
+    ----
+    num_neuron_d : {str : int}
+        {network : number of neurons}. Here a network could be a layer,
+        or the stack of all layers, etc. A network is what's being
+        correlated as a single unit.
+    representations_d : {str : tensor}
+        {network : activations}. 
+    """
+
+    # Edit args
+    l = len(representation_fname_l)
+    if layerspec_l is None:
+        layerspec_l = ['all'] * l
+    if type(first_half_only_l) is not list:
+        first_half_only_l = [first_half_only_l] * l
+    if type(second_half_only_l) is not list :
+        second_half_only_l = [second_half_only_l] * l
+
+    # Main loop
+    num_neurons_d = {} 
+    representations_d = {} 
+    for loop_var in tqdm(zip(representation_fname_l, layerspec_l,
+                             first_half_only_l, second_half_only_l)):
+        fname, layerspec, first_half_only, second_half_only = loop_var
+
+        # Set `activations_h5`, `sentence_d`, `indices`
+        activations_h5 = h5py.File(fname, 'r')
+        indices = list(activations_h5.keys())[:limit]
+
+        # Set `num_layers`, `num_neurons`, `layers`
+        s = activations_h5[indices[0]].shape
+        num_layers = 1 if len(s)==2 else s[0]
+        num_neurons = s[-1]
+        if layerspec == "all":
+            layers = list(range(num_layers))
+        elif layerspec == "full":
+            layers = ["full"]
+        else:
+            layers = [layerspec]
+
+        # Set `num_neurons_d`, `representations_d`
+        for layer in layers:
+            # Create `representations_l`
+            representations_l = []
+            word_count = 0
+            for sentence_ix in indices: 
+                # Set `dim`, `n_word`, update `word_count`
+                shape = activations_h5[sentence_ix].shape
+                dim = len(shape)
+                if not (dim == 2 or dim == 3):
+                    raise ValueError('Improper array dimension in file: ' +
+                                     fname + "\nShape: " +
+                                     str(activations_h5[sentence_ix].shape))
+                if dim == 3:
+                    n_word = shape[1]
+                elif dim == 2:
+                    n_word = shape[0]
+                word_count += n_word
+
+                # Create `activations`
+                if layer == "full":
+                    activations = torch.FloatTensor(
+                        activations_h5[sentence_ix])
+                    if dim == 3:
+                        activations = activations.permute(1, 0, 2)
+                        activations = activations.contiguous().view(
+                            n_word, -1)
+                else:
+                    activations = torch.FloatTensor(
+                        activations_h5[sentence_ix][layer] if dim==3 else 
+                        activations_h5[sentence_ix]
+                    )
+
+                # Create `representations`
+                representations = activations
+                if first_half_only: 
+                    representations = torch.chunk(
+                        representations, chunks=2, dim=-1)[0]
+                elif second_half_only:
+                    representations = torch.chunk(
+                        representations, chunks=2, dim=-1)[1]
+                representations_l.append(representations)
+                # print("{mname}_{layer}".format(mname=fname2mname(fname), layer=layer), 
+                #     representations.shape)
+
+                # Early stop
+                if limit is not None and word_count >= limit:
+                    break
+
+            # Main update
+            network = "{mname}_{layer}".format(mname=fname2mname(fname), 
+                                                  layer=layer)
+            num_neurons_d[network] = representations_l[0].size()[-1]
+            representations_d[network] = torch.cat(representations_l)[:limit] 
+    
+    return num_neurons_d, representations_d
+
+
 class Method(object):
     """
     Abstract representation of a correlation method. 
@@ -197,8 +325,8 @@ class MaxMinCorr(Method):
             if other_network in self.corrs[network]: 
                 continue
 
-            print('network:', network)
-            print('other_network:', other_network)
+#             print('network:', network)
+#             print('other_network:', other_network)
 
             device = self.device
 
@@ -421,7 +549,8 @@ class CCA(Method):
         # Call it this regardless of if it's actually centered or scaled
         self.nrepresentations_d = {}
         if self.normalize_dimensions:
-            for network in tqdm(self.representations_d, desc='mu, sigma'):
+#             for network in tqdm(self.representations_d, desc='mu, sigma'):
+            for network in self.representations_d:
                 t = self.representations_d[network]
                 means = t.mean(0, keepdim=True)
                 stdevs = t.std(0, keepdim=True)
@@ -434,7 +563,8 @@ class CCA(Method):
         # {network: whitening_tensor}
         whitening_transforms = {} 
         pca_directions = {} 
-        for network in tqdm(self.nrepresentations_d, desc='pca'):
+#         for network in tqdm(self.nrepresentations_d, desc='pca'):
+        for network in self.nrepresentations_d:
             X = self.nrepresentations_d[network]
             U, S, V = torch.svd(X)
 
@@ -442,7 +572,7 @@ class CCA(Method):
             wanted_size = torch.sum(var_sums.lt(var_sums[-1] *
                                                 self.percent_variance)).item()
 
-            print('For network', network, 'wanted size is', wanted_size)
+#             print('For network', network, 'wanted size is', wanted_size)
 
             if self.save_cca_transforms:
                 whitening_transform = torch.mm(V, torch.diag(1/S))
@@ -466,10 +596,12 @@ class CCA(Method):
                                 self.nrepresentations_d}
         self.pw_similarities = {network: {} for network in
                                 self.nrepresentations_d}
-        for network, other_network in tqdm(p(self.nrepresentations_d,
-                                             self.nrepresentations_d),
-                                           desc='cca',
-                                           total=len(self.nrepresentations_d)**2):
+#         for network, other_network in tqdm(p(self.nrepresentations_d,
+#                                              self.nrepresentations_d),
+#                                            desc='cca',
+#                                            total=len(self.nrepresentations_d)**2):
+        for network, other_network in p(self.nrepresentations_d,
+                                        self.nrepresentations_d):
 
             if network == other_network:
                 continue
@@ -557,7 +689,8 @@ class LinCKA(Method):
     def compute_correlations(self):
         # Center
         if self.normalize_dimensions:
-            for network in tqdm(self.representations_d, desc='mu, sigma'):
+#             for network in tqdm(self.representations_d, desc='mu, sigma'):
+            for network in self.representations_d:
                 t = self.representations_d[network]
                 means = t.mean(0, keepdim=True)
 
@@ -567,10 +700,12 @@ class LinCKA(Method):
         # {network: {other: lincka_similarity}}
         self.similarities = {network: {} for network in
                              self.representations_d}
-        for network, other_network in tqdm(p(self.representations_d,
-                                             self.representations_d),
-                                           desc='lincka',
-                                           total=len(self.representations_d)**2):
+#         for network, other_network in tqdm(p(self.representations_d,
+#                                              self.representations_d),
+#                                            desc='lincka',
+#                                            total=len(self.representations_d)**2):
+        for network, other_network in p(self.representations_d,
+                                        self.representations_d):
 
             if network == other_network:
                 continue
